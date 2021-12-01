@@ -68,46 +68,50 @@ type Handler func(ctx *Context) error
 
 // Server is rpcx server that use TCP or UDP.
 type Server struct {
-	ln                 net.Listener
-	readTimeout        time.Duration
-	writeTimeout       time.Duration
-	gatewayHTTPServer  *http.Server
-	DisableHTTPGateway bool // should disable http invoke or not.
-	DisableJSONRPC     bool // should disable json rpc or not.
-	AsyncWrite         bool // set true if your server only serves few clients
+	ln                 net.Listener  // 监听器
+	readTimeout        time.Duration // 读取client端请求数据包的有效时间
+	writeTimeout       time.Duration // 写入client端响应数据包的有效时间
+	gatewayHTTPServer  *http.Server  // http网关
+	DisableHTTPGateway bool          // should disable http invoke or not.
+	DisableJSONRPC     bool          // should disable json rpc or not.
+	AsyncWrite         bool          // set true if your server only serves few clients
 
-	serviceMapMu sync.RWMutex
-	serviceMap   map[string]*service
+	serviceMapMu sync.RWMutex        // 保护service提供service记录表的安全(读多写少使用读写锁)
+	serviceMap   map[string]*service // server端提供service记录表
 
 	router map[string]Handler
 
 	mu         sync.RWMutex
-	activeConn map[net.Conn]struct{}
-	doneChan   chan struct{}
-	seq        uint64
+	activeConn map[net.Conn]struct{} // server提供的活跃connection记录表
+	doneChan   chan struct{}         // service完成通知channel
+	seq        uint64                // server端ID
 
-	inShutdown int32
-	onShutdown []func(s *Server)
+	inShutdown int32             //  中断
+	onShutdown []func(s *Server) // 中断处理函数
 	onRestart  []func(s *Server)
 
+	// tls tcp连接时的配置项
 	// TLSConfig for creating tls tcp connection.
 	tlsConfig *tls.Config
+	// 主要使用kcp协议时的提供的一些限制
 	// BlockCrypt for kcp.BlockCrypt
 	options map[string]interface{}
 
 	// CORS options
 	corsOptions *CORSOptions
 
-	Plugins PluginContainer
+	Plugins PluginContainer // 通过plugin的方式 增加server的一些特性
 
 	// AuthFunc can be used to auth.
-	AuthFunc func(ctx context.Context, req *protocol.Message, token string) error
+	AuthFunc func(ctx context.Context, req *protocol.Message, token string) error // 认证
 
-	handlerMsgNum int32
+	handlerMsgNum int32 // 处理消息量
 
 	HandleServiceError func(error)
 }
 
+// 新建Server
+// 目前支持OptionFn： WithTLSConfig()、WithReadTimeout()、WithWriteTimeout()
 // NewServer returns a server.
 func NewServer(options ...OptionFn) *Server {
 	s := &Server{
@@ -130,6 +134,7 @@ func NewServer(options ...OptionFn) *Server {
 	return s
 }
 
+// 返回正在监听的adress
 // Address returns listened address.
 func (s *Server) Address() net.Addr {
 	s.mu.RLock()
@@ -140,10 +145,12 @@ func (s *Server) Address() net.Addr {
 	return s.ln.Addr()
 }
 
+// 增加handler，即向route中增加handler；也即为某服务的某方法增加handler
 func (s *Server) AddHandler(servicePath, serviceMethod string, handler func(*Context) error) {
 	s.router[servicePath+"."+serviceMethod] = handler
 }
 
+// ActiveClientConn返回活跃状态的连接
 // ActiveClientConn returns active connections.
 func (s *Server) ActiveClientConn() []net.Conn {
 	s.mu.RLock()
@@ -191,6 +198,7 @@ func (s *Server) getDoneChan() <-chan struct{} {
 	return s.doneChan
 }
 
+// 开启shutdown监听器
 // startShutdownListener start a new goroutine to notify SIGTERM
 // and SIGHUP signals and handle them gracefully
 func (s *Server) startShutdownListener() {
@@ -198,14 +206,14 @@ func (s *Server) startShutdownListener() {
 		log.Info("server pid:", os.Getpid())
 
 		// channel to receive notifications of SIGTERM and SIGHUP
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGTERM, syscall.SIGHUP)
+		ch := make(chan os.Signal, 1)                      // 使用系统信号
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGHUP) // 开启服务端shutdown信号通知
 
 		// custom functions to handle signal SIGTERM and SIGHUP
 		var customFuncs []func(s *Server)
 
-		switch <-ch {
-		case syscall.SIGTERM:
+		switch <-ch { // 获取channel 系统信号
+		case syscall.SIGTERM: // 中断信号
 			customFuncs = append(s.onShutdown, func(s *Server) {
 				s.Shutdown(context.Background())
 			})
@@ -221,18 +229,21 @@ func (s *Server) startShutdownListener() {
 	}(s)
 }
 
+// 启动server并监听client的请求
+// 该操作属于阻塞的  直到接收到client的连接connection
+// Serve支持TCP/UDP以及Http
 // Serve starts and listens RPC requests.
 // It is blocked until receiving connections from clients.
 func (s *Server) Serve(network, address string) (err error) {
-	s.startShutdownListener()
+	s.startShutdownListener() // 开启server中断监听 主要用于优雅关闭对应的Connecton
 	var ln net.Listener
-	ln, err = s.makeListener(network, address)
+	ln, err = s.makeListener(network, address) // 获取对应的listener
 	if err != nil {
 		return
 	}
 
-	if network == "http" {
-		s.serveByHTTP(ln, "")
+	if network == "http" { // 通过http协议
+		s.serveByHTTP(ln, "") // 劫持Http连接
 		return nil
 	}
 
@@ -262,6 +273,9 @@ func (s *Server) ServeListener(network string, ln net.Listener) (err error) {
 	return s.serveListener(ln)
 }
 
+// serveListener 接收ln上的connection
+// connection开启一个goroutine来处理对应的请求.
+// 对应Service的goroutine读取request并调用真正的Service来执行再返回对应的结果.
 // serveListener accepts incoming connections on the Listener ln,
 // creating a new service goroutine for each.
 // The service goroutines read requests and then call services to reply to them.
@@ -273,27 +287,27 @@ func (s *Server) serveListener(ln net.Listener) error {
 	s.mu.Unlock()
 
 	for {
-		conn, e := ln.Accept()
+		conn, e := ln.Accept() // 接收客户端请求
 		if e != nil {
 			select {
-			case <-s.getDoneChan():
+			case <-s.getDoneChan(): // 通过Done 接收一些中断异常的信号 直接停止Server
 				return ErrServerClosed
 			default:
 			}
 
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+			if ne, ok := e.(net.Error); ok && ne.Temporary() { // 当出现非中断错误时 进行延迟重试
 				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
+					tempDelay = 5 * time.Millisecond // 默认5ms
 				} else {
-					tempDelay *= 2
+					tempDelay *= 2 // 当设置延迟重试时间 以2^n进行倍数递增(<=1s)
 				}
 
-				if max := 1 * time.Second; tempDelay > max {
+				if max := 1 * time.Second; tempDelay > max { // 防止延迟重试时间过久
 					tempDelay = max
 				}
 
 				log.Errorf("rpcx: Accept error: %v; retrying in %v", e, tempDelay)
-				time.Sleep(tempDelay)
+				time.Sleep(tempDelay) // 休眠当前执行线程
 				continue
 			}
 
@@ -302,32 +316,32 @@ func (s *Server) serveListener(ln net.Listener) error {
 			}
 			return e
 		}
-		tempDelay = 0
+		tempDelay = 0 // 延迟重试时间需要置0，防止影响下一次出现net.Error时，延迟重试时间错误
 
-		if tc, ok := conn.(*net.TCPConn); ok {
+		if tc, ok := conn.(*net.TCPConn); ok { // tcp连接
 			period := s.options["TCPKeepAlivePeriod"]
 			if period != nil {
-				tc.SetKeepAlive(true)
-				tc.SetKeepAlivePeriod(period.(time.Duration))
-				tc.SetLinger(10)
+				tc.SetKeepAlive(true)                         // 保持长连接
+				tc.SetKeepAlivePeriod(period.(time.Duration)) // 检查周期3min
+				tc.SetLinger(10)                              // 指定connection的关闭行为
 			}
 		}
 
-		conn, ok := s.Plugins.DoPostConnAccept(conn)
+		conn, ok := s.Plugins.DoPostConnAccept(conn) // 处理接收到conn：执行connection定义的plugin
 		if !ok {
 			conn.Close()
 			continue
 		}
 
 		s.mu.Lock()
-		s.activeConn[conn] = struct{}{}
+		s.activeConn[conn] = struct{}{} // 使用空struct来标记connection已用
 		s.mu.Unlock()
 
 		if share.Trace {
 			log.Debugf("server accepted an conn: %v", conn.RemoteAddr().String())
 		}
 
-		go s.serveConn(conn)
+		go s.serveConn(conn) // 单独开启goroutine来执行connection
 	}
 }
 
@@ -336,14 +350,14 @@ func (s *Server) serveListener(ln net.Listener) error {
 func (s *Server) serveByHTTP(ln net.Listener, rpcPath string) {
 	s.ln = ln
 
-	if rpcPath == "" {
+	if rpcPath == "" { // rpcPath为空字符串时，则使用"/_rpcx_"代替
 		rpcPath = share.DefaultRPCPath
 	}
 	mux := http.NewServeMux()
-	mux.Handle(rpcPath, s)
-	srv := &http.Server{Handler: mux}
+	mux.Handle(rpcPath, s)            // 执行http的Handle  s本身就是一个Handler
+	srv := &http.Server{Handler: mux} // 构建http Server
 
-	srv.Serve(ln)
+	srv.Serve(ln) // 启动http Server
 }
 
 func (s *Server) serveByWS(ln net.Listener, rpcPath string) {
@@ -384,6 +398,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		s.closeConn(conn)
 	}()
 
+	// 当=tsl connection需要进行额外设置
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if d := s.readTimeout; d != 0 {
 			conn.SetReadDeadline(time.Now().Add(d))
@@ -397,6 +412,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 	}
 
+	// 设置conn读取buffer 默认1kb
 	r := bufio.NewReaderSize(conn, ReaderBuffsize)
 
 	var writeCh chan *[]byte
@@ -407,7 +423,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 
 	for {
-		if s.isShutdown() {
+		if s.isShutdown() { //connection是否中断
 			return
 		}
 
@@ -418,7 +434,8 @@ func (s *Server) serveConn(conn net.Conn) {
 
 		ctx := share.WithValue(context.Background(), RemoteConnContextKey, conn)
 
-		req, err := s.readRequest(ctx, r)
+		req, err := s.readRequest(ctx, r) // 获取client的request
+		// 读取request时出现error处理
 		if err != nil {
 			protocol.FreeMsg(req)
 
@@ -442,19 +459,20 @@ func (s *Server) serveConn(conn net.Conn) {
 
 		ctx = share.WithLocalValue(ctx, StartRequestContextKey, time.Now().UnixNano())
 		closeConn := false
-		if !req.IsHeartbeat() {
+		if !req.IsHeartbeat() { // 认证 非心跳请求
 			err = s.auth(ctx, req)
 			closeConn = err != nil
 		}
 
 		if err != nil {
-			if !req.IsOneway() {
+			if !req.IsOneway() { // 是否需要响应
 				res := req.Clone()
-				res.SetMessageType(protocol.Response)
-				if len(res.Payload) > 1024 && req.CompressType() != protocol.None {
+				res.SetMessageType(protocol.Response)                               // 执行消息类型
+				if len(res.Payload) > 1024 && req.CompressType() != protocol.None { //数据压缩传输
 					res.SetCompressType(req.CompressType())
 				}
 				handleError(res, err)
+				// 处理response
 				s.Plugins.DoPreWriteResponse(ctx, req, res, err)
 				data := res.EncodeSlicePointer()
 				if s.AsyncWrite {
@@ -464,7 +482,7 @@ func (s *Server) serveConn(conn net.Conn) {
 					protocol.PutData(data)
 				}
 				s.Plugins.DoPostWriteResponse(ctx, req, res, err)
-				protocol.FreeMsg(res)
+				protocol.FreeMsg(res) // 为减少Message实例化的资源占用，采用缓存Message的方式重用
 			} else {
 				s.Plugins.DoPreWriteResponse(ctx, req, nil, err)
 			}
@@ -476,17 +494,17 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 			continue
 		}
-		go func() {
+		go func() { // 开启一个goroutine处理request
 			defer func() {
 				if r := recover(); r != nil {
 					// maybe panic because the writeCh is closed.
 				}
 			}()
 
-			atomic.AddInt32(&s.handlerMsgNum, 1)
-			defer atomic.AddInt32(&s.handlerMsgNum, -1)
+			atomic.AddInt32(&s.handlerMsgNum, 1)        // 记录处理msg的数量：待执行时+1
+			defer atomic.AddInt32(&s.handlerMsgNum, -1) // 执行完成-1
 
-			if req.IsHeartbeat() {
+			if req.IsHeartbeat() { // 心跳包：直接设置Message类型，并对request重新编码返回
 				s.Plugins.DoHeartbeatRequest(ctx, req)
 				req.SetMessageType(protocol.Response)
 				data := req.EncodeSlicePointer()
@@ -652,14 +670,14 @@ func (s *Server) auth(ctx context.Context, req *protocol.Message) error {
 }
 
 func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res *protocol.Message, err error) {
-	serviceName := req.ServicePath
-	methodName := req.ServiceMethod
+	serviceName := req.ServicePath  // Service定义的Path
+	methodName := req.ServiceMethod // Service中的方法
 
-	res = req.Clone()
+	res = req.Clone() // 复制request
 
 	res.SetMessageType(protocol.Response)
 	s.serviceMapMu.RLock()
-	service := s.serviceMap[serviceName]
+	service := s.serviceMap[serviceName] // 获取注册的service
 
 	if share.Trace {
 		log.Debugf("server get service %+v for an request %+v", service, req)
@@ -682,13 +700,13 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 	// get a argv object from object pool
 	argv := reflectTypePools.Get(mtype.ArgType)
 
-	codec := share.Codecs[req.SerializeType()]
+	codec := share.Codecs[req.SerializeType()] //获取编码格式
 	if codec == nil {
 		err = fmt.Errorf("can not find codec for %d", req.SerializeType())
 		return handleError(res, err)
 	}
 
-	err = codec.Decode(req.Payload, argv)
+	err = codec.Decode(req.Payload, argv) // 解码请求内容
 	if err != nil {
 		return handleError(res, err)
 	}
@@ -703,7 +721,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 		return handleError(res, err)
 	}
 
-	if mtype.ArgType.Kind() != reflect.Ptr {
+	if mtype.ArgType.Kind() != reflect.Ptr { // service调用
 		err = service.call(ctx, mtype, reflect.ValueOf(argv).Elem(), reflect.ValueOf(replyv))
 	} else {
 		err = service.call(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
@@ -718,7 +736,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 
 	if err != nil {
 		if replyv != nil {
-			data, err := codec.Encode(replyv)
+			data, err := codec.Encode(replyv) //编码response
 			// return reply to object pool
 			reflectTypePools.Put(mtype.ReplyType, replyv)
 			if err != nil {
@@ -726,7 +744,7 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 			}
 			res.Payload = data
 		}
-		return handleError(res, err)
+		return handleError(res, err) //返回response结果
 	}
 
 	if !req.IsOneway() {
